@@ -128,7 +128,9 @@ class PaperIndex:
         
         for paper in papers:
             ext_id = paper.get("external_id")
-            title = (paper.get("title") or "").strip()
+            # External providers may return null for optional metadata. Normalize
+            # it before embedding and persisting so every indexed field is text.
+            title = str(paper.get("title") or "").strip()
             title_lower = title.lower()
             
             if (ext_id and ext_id in existing_ids) or (title_lower and title_lower in existing_titles):
@@ -139,7 +141,7 @@ class PaperIndex:
             if title_lower:
                 existing_titles.add(title_lower)
                 
-            abstract = paper.get("abstract", "")
+            abstract = str(paper.get("abstract") or "").strip()
             text = f"{title} [SEP] {abstract}"
             texts.append(text)
             
@@ -196,7 +198,9 @@ class PaperIndex:
         for score, idx in zip(scores[0], indices[0]):
             if idx != -1 and idx < len(self.mapping):
                 result = self.mapping[idx].copy()
-                title = result.get('title', '').strip()
+                # Older mapping files can already contain null values, so keep
+                # search compatible with them as well as newly indexed papers.
+                title = str(result.get('title') or '').strip()
                 title_lower = title.lower()
                 
                 if title_lower in seen_titles:
@@ -204,7 +208,7 @@ class PaperIndex:
                 seen_titles.add(title_lower)
                 
                 dense_score = float(score)
-                abstract_lower = result.get('abstract', '').lower()
+                abstract_lower = str(result.get('abstract') or '').lower()
                 
                 # Check keyword matches
                 title_matches = sum(1 for w in query_words if w in title_lower)
