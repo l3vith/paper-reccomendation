@@ -28,8 +28,12 @@ def load_training_data(triplets_path: str, test_split: float = 0.2) -> Tuple[Lis
     logging.info(f"Loading training data from {triplets_path}")
     df = pd.read_csv(triplets_path)
     
-    # Split into train and test
-    train_df, test_df = train_test_split(df, test_size=test_split, random_state=42)
+    # Split by query paper so an anchor and its positives never leak across
+    # training and evaluation through separate rows.
+    anchors = df['anchor_text'].drop_duplicates().tolist()
+    train_anchors, test_anchors = train_test_split(anchors, test_size=test_split, random_state=42)
+    train_df = df[df['anchor_text'].isin(set(train_anchors))]
+    test_df = df[df['anchor_text'].isin(set(test_anchors))]
     
     def df_to_examples(dataframe):
         examples = []
@@ -53,7 +57,9 @@ def create_model(
     use_lora: bool = True,
     lora_r: int = 16,
     lora_alpha: int = 32,
-    lora_dropout: float = 0.05
+    lora_dropout: float = 0.05,
+    pooling: str = "mean",
+    device: str | None = None,
 ) -> SentenceTransformer:
     """
     Load and configure the SentenceTransformer model with optional Q-LoRA (4-bit NF4) adaptation.
@@ -100,7 +106,10 @@ def create_model(
             
             # Prepare model for quantized training if 4-bit enabled
             if use_qlora and hasattr(word_embedding_model.auto_model, "is_loaded_in_4bit") and word_embedding_model.auto_model.is_loaded_in_4bit:
-                word_embedding_model.auto_model = prepare_model_for_kbit_training(word_embedding_model.auto_model)
+                # ``auto_model`` is a read-only compatibility property in current
+                # sentence-transformers. Assign the wrapped model to ``model`` so
+                # forward(), saving, and later LoRA merging all use it.
+                word_embedding_model.model = prepare_model_for_kbit_training(word_embedding_model.auto_model)
                 logger.info("Model prepared for k-bit (4-bit) Q-LoRA training.")
 
             logger.info(f"Applying Q-LoRA / LoRA adapters (rank={lora_r}, alpha={lora_alpha}, dropout={lora_dropout})...")
@@ -112,7 +121,7 @@ def create_model(
                 lora_dropout=lora_dropout,
                 bias="none"
             )
-            word_embedding_model.auto_model = get_peft_model(word_embedding_model.auto_model, lora_config)
+            word_embedding_model.model = get_peft_model(word_embedding_model.auto_model, lora_config)
             
             # Log parameter count
             trainable_params = sum(p.numel() for p in word_embedding_model.auto_model.parameters() if p.requires_grad)
@@ -125,16 +134,30 @@ def create_model(
             logging.warning(f"Could not apply Q-LoRA: {e}. Falling back to full fine-tuning.")
 
     pooling_dim = word_embedding_model.get_word_embedding_dimension()
-    pooling_model = models.Pooling(pooling_dim, pooling_mode="mean")
-    model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
+    pooling_options = {
+        "mean": {"pooling_mode_mean_tokens": True},
+        "cls": {"pooling_mode_cls_token": True},
+        "mean_max": {"pooling_mode_mean_tokens": True, "pooling_mode_max_tokens": True},
+        "weighted_mean": {"pooling_mode_weightedmean_tokens": True},
+    }
+    if pooling not in pooling_options:
+        raise ValueError(f"Unsupported pooling architecture: {pooling}")
+    pooling_model = models.Pooling(pooling_dim, **pooling_options[pooling])
+    # device=None keeps previous behavior (auto: MPS/CUDA when available).
+    # Training callers pass device="cpu" for stability inside the web process.
+    if device is None:
+        model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
+    else:
+        model = SentenceTransformer(modules=[word_embedding_model, pooling_model], device=device)
     return model
 
 def train(model: SentenceTransformer, train_examples: List[InputExample], 
           output_path: str = 'models/scibert-finetuned-papers', 
           epochs: int = 2, batch_size: int = 8, 
-          learning_rate: float = 2e-5, warmup_steps: int = 50) -> None:
+          learning_rate: float = 2e-5, warmup_steps: int = 50,
+          steps_per_epoch: int | None = None) -> None:
     """
-    Fine-tune the model using TripletLoss.
+    Fine-tune the model using in-batch multiple-negative ranking loss.
     
     Args:
         model (SentenceTransformer): The base model.
@@ -146,6 +169,8 @@ def train(model: SentenceTransformer, train_examples: List[InputExample],
         warmup_steps (int): Number of warmup steps for learning rate scheduler.
     """
     import os
+    import gc
+    gc.collect()
     os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
     if torch.backends.mps.is_available():
         try:
@@ -162,16 +187,22 @@ def train(model: SentenceTransformer, train_examples: List[InputExample],
         pin_memory=False
     )
     
-    # Use TripletLoss with COSINE distance and margin 0.5
-    train_loss = losses.TripletLoss(model=model, distance_metric=losses.TripletDistanceMetric.COSINE, triplet_margin=0.5)
+    # In-batch contrastive ranking: every positive and explicit hard negative
+    # in the batch becomes a negative for the other anchors. This supplies a
+    # much stronger retrieval signal than comparing one triplet at a time.
+    train_loss = losses.MultipleNegativesRankingLoss(model=model, scale=20.0)
     
     logging.info(f"Starting training for {epochs} epochs (batch_size={batch_size})")
+    fit_kwargs = {}
+    if steps_per_epoch is not None:
+        fit_kwargs["steps_per_epoch"] = max(1, int(steps_per_epoch))
     model.fit(
         train_objectives=[(train_dataloader, train_loss)],
         epochs=epochs,
         warmup_steps=warmup_steps,
         optimizer_params={'lr': learning_rate},
-        show_progress_bar=True
+        show_progress_bar=True,
+        **fit_kwargs,
     )
     
     # If LoRA was used, merge adapter weights into a clean base model before saving
@@ -181,17 +212,11 @@ def train(model: SentenceTransformer, train_examples: List[InputExample],
                 logging.info("Merging LoRA adapter weights into base SciBERT model...")
                 merged_base = model[0].auto_model.merge_and_unload()
                 
-                # Re-wrap into clean standard SentenceTransformer
-                clean_transformer = models.Transformer(
-                    model_name_or_path='allenai/scibert_scivocab_uncased',
-                    max_seq_length=256
-                )
-                clean_transformer.auto_model = merged_base
-                clean_transformer.tokenizer = model[0].tokenizer
-                pooling_model = model[1]
-                
-                clean_model = SentenceTransformer(modules=[clean_transformer, pooling_model])
-                clean_model.save(output_path)
+                # Reuse the existing Transformer wrapper. Constructing another
+                # SciBERT module here briefly doubled memory at the point where
+                # optimizer/training allocations were already resident.
+                model[0].model = merged_base
+                model.save(output_path)
                 logging.info(f"Training complete. Clean merged production model saved to {output_path}")
                 return
     except Exception as e:
@@ -211,6 +236,7 @@ if __name__ == '__main__':
     parser.add_argument('--qlora', action='store_true', default=True, help='Use 4-bit Q-LoRA parameter-efficient fine-tuning (default: True)')
     parser.add_argument('--no-qlora', action='store_false', dest='qlora', help='Disable Q-LoRA (perform full fine-tuning)')
     parser.add_argument('--lora-r', type=int, default=16, help='LoRA rank')
+    parser.add_argument('--variant', choices=['mean', 'cls', 'mean_max', 'weighted_mean'], default='mean', help='SciBERT pooling architecture')
     
     args = parser.parse_args()
     
@@ -220,5 +246,5 @@ if __name__ == '__main__':
     print("------------------------------\n")
     
     train_data, _ = load_training_data(args.triplets)
-    model = create_model(args.base_model, use_qlora=args.qlora, lora_r=args.lora_r)
+    model = create_model(args.base_model, use_qlora=args.qlora, lora_r=args.lora_r, pooling=args.variant)
     train(model, train_data, output_path=args.output, epochs=args.epochs, batch_size=args.batch_size, learning_rate=args.lr)

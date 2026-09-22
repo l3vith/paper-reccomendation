@@ -10,7 +10,9 @@ from typing import Any, Dict, List, Optional
 
 import faiss
 import numpy as np
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +24,8 @@ class PaperIndex:
         self,
         model_path: str = "models/scibert-finetuned-papers",
         index_path: str = "data/faiss_index.bin",
-        mapping_path: str = "data/paper_id_map.json"
+        mapping_path: str = "data/paper_id_map.json",
+        pooling: str = "mean",
     ) -> None:
         """
         Initialize the PaperIndex.
@@ -35,20 +38,26 @@ class PaperIndex:
         self.model_path = model_path
         self.index_path = index_path
         self.mapping_path = mapping_path
+        self.pooling = pooling
 
         import warnings
         warnings.filterwarnings("ignore")
         logging.getLogger("transformers").setLevel(logging.ERROR)
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
-        # Resolve local absolute path if directory exists
-        load_target = os.path.abspath(model_path) if os.path.isdir(model_path) else model_path
-
-        try:
-            self.model = SentenceTransformer(load_target)
-        except Exception as e:
-            logger.warning(f"Could not load model from {model_path}, using default. Error: {e}")
-            self.model = SentenceTransformer('allenai/scibert_scivocab_uncased')
+        # A missing local checkpoint must NOT be passed to SentenceTransformer:
+        # it would be treated as a Hugging Face repo ID and fail with a 401.
+        if os.path.isdir(model_path):
+            try:
+                self.model = SentenceTransformer(os.path.abspath(model_path))
+            except Exception as e:
+                logger.warning(f"Could not load model from {model_path}, using the untrained {pooling} profile. Error: {e}")
+                from src.model.train import create_model
+                self.model = create_model('allenai/scibert_scivocab_uncased', use_qlora=False, use_lora=False, pooling=pooling)
+        else:
+            logger.info(f"No local checkpoint at {model_path}; using base allenai/scibert_scivocab_uncased with {pooling} pooling.")
+            from src.model.train import create_model
+            self.model = create_model('allenai/scibert_scivocab_uncased', use_qlora=False, use_lora=False, pooling=pooling)
             
         if hasattr(self.model, "get_embedding_dimension"):
             self.dimension = self.model.get_embedding_dimension()
@@ -58,8 +67,20 @@ class PaperIndex:
         # Initialize or load FAISS index and mapping
         self.index = faiss.IndexFlatIP(self.dimension)
         self.mapping: List[Dict[str, Any]] = []
+        self._bm25: Optional[BM25Okapi] = None
+        self._bm25_tokens: List[List[str]] = []
         
         self.load()
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        """Tokenize scientific text consistently for BM25."""
+        return re.findall(r"[a-z0-9]+(?:[-'][a-z0-9]+)?", text.lower())
+
+    def _rebuild_bm25(self) -> None:
+        corpus = [f"{item.get('title') or ''} {item.get('abstract') or ''}" for item in self.mapping]
+        self._bm25_tokens = [self._tokenize(text) for text in corpus]
+        self._bm25 = BM25Okapi(self._bm25_tokens) if self._bm25_tokens else None
 
     def build_index(self, db_path: str = "data/papers.db") -> int:
         """
@@ -165,6 +186,7 @@ class PaperIndex:
         
         self.index.add(embeddings)
         self.mapping.extend(new_mappings)
+        self._rebuild_bm25()
         self.save()
         return len(texts)
 
@@ -186,16 +208,27 @@ class PaperIndex:
         embedding = self.model.encode([query_text], convert_to_numpy=True)
         faiss.normalize_L2(embedding)
         
-        candidate_k = min(max(top_k * 4, 30), self.index.ntotal)
-        scores, indices = self.index.search(embedding, candidate_k)
-        
-        stopwords = {'and', 'the', 'for', 'with', 'from', 'in', 'on', 'of', 'a', 'an', 'to', 'is', 'are', 'as', 'by', 'using', 'via'}
-        query_words = [w.lower() for w in query_text.split() if len(w) > 2 and w.lower() not in stopwords]
+        candidate_k = min(max(top_k * 10, 100), self.index.ntotal)
+        dense_scores, dense_indices = self.index.search(embedding, candidate_k)
+
+        if self._bm25 is None:
+            self._rebuild_bm25()
+        bm25_all = self._bm25.get_scores(self._tokenize(query_text)) if self._bm25 else np.zeros(len(self.mapping))
+        lexical_indices = np.argsort(-bm25_all)[:candidate_k]
+
+        # Fuse the dense and lexical candidate sets before scoring. This
+        # recovers papers with exact scientific terminology that a dense-only
+        # search can miss while retaining semantically related results.
+        dense_by_index = {int(index): float(score) for score, index in zip(dense_scores[0], dense_indices[0]) if index >= 0}
+        candidate_indices = list(dict.fromkeys([*dense_by_index, *map(int, lexical_indices)]))
+        lexical_values = np.asarray([bm25_all[index] for index in candidate_indices], dtype=np.float32)
+        lexical_min = float(lexical_values.min()) if len(lexical_values) else 0.0
+        lexical_range = float(np.ptp(lexical_values)) if len(lexical_values) else 0.0
         
         candidates = []
         seen_titles = set()
         
-        for score, idx in zip(scores[0], indices[0]):
+        for idx in candidate_indices:
             if idx != -1 and idx < len(self.mapping):
                 result = self.mapping[idx].copy()
                 # Older mapping files can already contain null values, so keep
@@ -207,19 +240,16 @@ class PaperIndex:
                     continue
                 seen_titles.add(title_lower)
                 
-                dense_score = float(score)
-                abstract_lower = str(result.get('abstract') or '').lower()
-                
-                # Check keyword matches
-                title_matches = sum(1 for w in query_words if w in title_lower)
-                abstract_matches = sum(1 for w in query_words if w in abstract_lower)
-                
-                # Keyword relevance weighting
-                keyword_boost = (title_matches * 0.12) + (abstract_matches * 0.04)
-                combined_score = min(dense_score + keyword_boost, 0.99)
+                dense_score = dense_by_index.get(idx)
+                if dense_score is None:
+                    dense_score = float(np.dot(embedding[0], self.index.reconstruct(idx)))
+                lexical_score = (float(bm25_all[idx]) - lexical_min) / lexical_range if lexical_range > 0 else 0.0
+                normalized_dense = max(0.0, min(1.0, (dense_score + 1.0) / 2.0))
+                combined_score = (0.35 * normalized_dense) + (0.65 * lexical_score)
                 
                 result["score"] = combined_score
                 result["raw_dense_score"] = dense_score
+                result["bm25_score"] = float(bm25_all[idx])
                 candidates.append(result)
                 
         # Sort by combined hybrid score
@@ -249,6 +279,7 @@ class PaperIndex:
                 self.index = faiss.read_index(self.index_path)
                 with open(self.mapping_path, 'r', encoding='utf-8') as f:
                     self.mapping = json.load(f)
+                self._rebuild_bm25()
                 logger.info(f"Loaded index with {self.index.ntotal} vectors.")
             except Exception as e:
                 logger.error(f"Error loading index/mapping: {e}")

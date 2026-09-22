@@ -27,6 +27,7 @@ class PaperRecommender:
         model_path: str = "models/scibert-finetuned-papers",
         index_path: str = "data/faiss_index.bin",
         mapping_path: str = "data/paper_id_map.json",
+        pooling: str = "mean",
         db_path: str = "data/papers.db"
     ) -> None:
         """
@@ -38,7 +39,7 @@ class PaperRecommender:
             mapping_path: Path to the ID mapping.
             db_path: Path to the local database.
         """
-        self.index = PaperIndex(model_path, index_path, mapping_path)
+        self.index = PaperIndex(model_path, index_path, mapping_path, pooling=pooling)
         self.store = PaperStore(db_path)
         self.expander = ScientificQueryExpander(db_path=db_path)
 

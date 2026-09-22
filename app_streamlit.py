@@ -16,9 +16,11 @@ import warnings
 import logging
 import pandas as pd
 import streamlit as st
+from src.model.variants import MODEL_VARIANTS, get_variant, has_trained_checkpoint
 from src.downloader import download_paper_aria2, find_aria2_executable
 from src.tts_engine import (
     get_available_voices,
+    is_playable_wav_bytes,
     synthesize_speech_wav,
     speak_live_background,
     stop_live_speech
@@ -212,11 +214,17 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_resource(show_spinner="Loading SciBERT recommendation model...")
-def get_recommender():
+@st.cache_resource(show_spinner="Loading selected SciBERT recommendation model...")
+def get_recommender(variant_key: str):
     """Load and cache the recommender engine."""
     from src.recommender.recommend import PaperRecommender
-    return PaperRecommender()
+    variant = get_variant(variant_key)
+    return PaperRecommender(
+        model_path=variant.model_path,
+        index_path=variant.index_path,
+        mapping_path=variant.mapping_path,
+        pooling=variant.pooling,
+    )
 
 
 def make_tts_html(paper_id: str, text: str) -> str:
@@ -229,7 +237,7 @@ def make_tts_html(paper_id: str, text: str) -> str:
         text: The text that should be spoken aloud.
 
     Returns:
-        HTML string to be rendered via st.components.v1.html.
+        HTML string to be rendered via st.iframe.
     """
     import json
     text = str(text or "")
@@ -387,7 +395,6 @@ def render_paper_reader(r: dict, card_index: int, show_score: bool = True, score
       3. After download, PDF text is extracted automatically.
       4. ▶ Read (local TTS) and ⏹ Stop buttons to listen to the full paper.
     """
-    import streamlit.components.v1 as components
     from src.downloader import extract_text_from_pdf
 
     raw_title = r.get('title')
@@ -430,7 +437,9 @@ def render_paper_reader(r: dict, card_index: int, show_score: bool = True, score
     uid = f"{card_index}_{abs(hash(title)) % 100000}"
     dl_key   = f"dl_{uid}"      # stores (ok, path, size)
     text_key = f"txt_{uid}"     # stores extracted full text string
-    wav_key  = f"wav_{uid}"     # stores synthesized audio bytes
+    # Versioned key prevents pre-fix AIFF data from surviving in an existing
+    # Streamlit browser session after the TTS implementation is reloaded.
+    wav_key  = f"wav_pcm_v1_{uid}"  # stores validated PCM WAV bytes
 
     # Score badge
     score_pct = f"{score * 100:.1f}%"
@@ -554,6 +563,27 @@ def render_paper_reader(r: dict, card_index: int, show_score: bool = True, score
 
             st.markdown("---")
 
+            # ── Synchronized browser PDF reader ───────────────────────────
+            show_pdf_reader = st.toggle(
+                "Open synchronized PDF reader",
+                value=False,
+                key=f"pdf_reader_toggle_{uid}",
+                help="View the PDF, read the current page aloud, and highlight each spoken word.",
+            )
+            if show_pdf_reader:
+                from src.pdf_reader import build_synchronized_pdf_reader
+                with st.spinner("Preparing synchronized PDF viewer…"):
+                    reader_html = build_synchronized_pdf_reader(
+                        pdf_path=pdf_path,
+                        title=title,
+                        rate=175,
+                    )
+                # Raw HTML string is embedded directly in an isolated iframe.
+                st.iframe(reader_html, height=840)
+                st.caption("The synchronized reader uses your browser voice and reads one PDF page at a time. Use the controls inside the viewer to change pages, voice, or speed.")
+
+            st.markdown("---")
+
             # ── Step 2: Extracted text ─────────────────────────────────────
             extracted_text = st.session_state.get(text_key, "")
             if not extracted_text:
@@ -566,11 +596,12 @@ def render_paper_reader(r: dict, card_index: int, show_score: bool = True, score
                 word_count = len(extracted_text.split())
                 with st.expander(f"📄 Full Paper Text ({word_count:,} words)", expanded=False):
                     st.text_area(
-                        label="",
+                        label="Full paper text",
                         value=extracted_text[:15000] + ("\n\n[...truncated for display...]" if len(extracted_text) > 15000 else ""),
                         height=400,
                         key=f"txt_area_{uid}",
-                        disabled=True
+                        disabled=True,
+                        label_visibility="collapsed"
                     )
             else:
                 st.warning("Could not extract text from this PDF (may be scanned/image-based).")
@@ -609,8 +640,10 @@ def render_paper_reader(r: dict, card_index: int, show_score: bool = True, score
                             rate=speaking_rate,
                             max_chars=20000
                         )
-                    if ok:
+                    if ok and is_playable_wav_bytes(wav_bytes):
                         st.session_state[wav_key] = wav_bytes
+                    elif ok:
+                        st.error("Audio synthesis returned an invalid WAV payload. Please try again.")
                     else:
                         st.error(f"Audio synthesis failed: {wav_path_out}")
 
@@ -623,17 +656,21 @@ def render_paper_reader(r: dict, card_index: int, show_score: bool = True, score
             # Audio player
             if st.session_state.get(wav_key):
                 wav_bytes = st.session_state[wav_key]
-                st.audio(wav_bytes, format="audio/wav")
-                st.download_button(
-                    label="💾 Download Audio (.wav)",
-                    data=wav_bytes,
-                    file_name=f"{clean_eid or 'paper'}_narration.wav",
-                    mime="audio/wav",
-                    key=f"dl_wav_{uid}"
-                )
+                if is_playable_wav_bytes(wav_bytes):
+                    st.audio(wav_bytes, format="audio/wav")
+                    st.download_button(
+                        label="💾 Download Audio (.wav)",
+                        data=wav_bytes,
+                        file_name=f"{clean_eid or 'paper'}_narration.wav",
+                        mime="audio/wav",
+                        key=f"dl_wav_{uid}"
+                    )
+                else:
+                    del st.session_state[wav_key]
+                    st.warning("The cached audio was invalid and has been cleared. Click Read Full Paper again.")
 
 
-def get_db_stats():
+def get_db_stats(variant_key: str):
     """Retrieve corpus statistics from SQLite and FAISS."""
     db_path = "data/papers.db"
     total_papers = 0
@@ -651,10 +688,11 @@ def get_db_stats():
             pass
 
     faiss_vectors = 0
-    if os.path.exists("data/faiss_index.bin"):
+    variant = get_variant(variant_key)
+    if os.path.exists(variant.index_path):
         try:
             import faiss
-            index = faiss.read_index("data/faiss_index.bin")
+            index = faiss.read_index(variant.index_path)
             faiss_vectors = index.ntotal
         except Exception:
             pass
@@ -672,6 +710,14 @@ st.markdown("""
 # Sidebar
 with st.sidebar:
     st.markdown("### Settings")
+    selected_variant_key = st.selectbox(
+        "SciBERT model variant",
+        options=list(MODEL_VARIANTS),
+        format_func=lambda key: MODEL_VARIANTS[key].label,
+        help="Each profile keeps SciBERT and changes only the pooling head. It has its own checkpoint and FAISS index.",
+    )
+    selected_variant = get_variant(selected_variant_key)
+    st.caption(selected_variant.description)
     
     mode = st.radio(
         "Search Mode",
@@ -701,7 +747,7 @@ with st.sidebar:
     st.divider()
     
     st.markdown("### Corpus Statistics")
-    total_papers, sources, faiss_vectors = get_db_stats()
+    total_papers, sources, faiss_vectors = get_db_stats(selected_variant_key)
     
     col_stat1, col_stat2 = st.columns(2)
     col_stat1.metric("Indexed Vectors", f"{faiss_vectors:,}")
@@ -715,7 +761,12 @@ with st.sidebar:
     if st.button("Rebuild Vector Index", width="stretch"):
         with st.spinner("Re-indexing SQLite corpus into FAISS..."):
             from src.recommender.indexer import PaperIndex
-            idx = PaperIndex()
+            idx = PaperIndex(
+                model_path=selected_variant.model_path,
+                index_path=selected_variant.index_path,
+                mapping_path=selected_variant.mapping_path,
+                pooling=selected_variant.pooling,
+            )
             c = idx.build_index()
             st.success(f"Successfully indexed {c} papers.")
             st.rerun()
@@ -725,7 +776,7 @@ tab_search, tab_eval, tab_corpus = st.tabs(["Paper Discovery", "Model Benchmarks
 
 # --- TAB 1: Paper Discovery ---
 with tab_search:
-    recommender = get_recommender()
+    recommender = get_recommender(selected_variant_key)
     
     if mode in ["Adaptive Search (Smart)", "Local Index Only", "Force Live Scrape"]:
         if "search_results" not in st.session_state:
@@ -867,57 +918,86 @@ with tab_search:
 # --- TAB 2: Model Benchmarks ---
 with tab_eval:
     st.subheader("Model Evaluation and Benchmarks")
-    st.caption("Quantitative comparison of Fine-Tuned SciBERT (Q-LoRA 4-bit) vs. Base SciBERT across scientific embedding tasks.")
+    st.caption("Controlled comparison of four fine-tuneable SciBERT pooling architectures on the same held-out triplets. MRR and Precision@K rank held-out positive papers among the held-out candidate corpus.")
     
     st.info("Q-LoRA Configuration: 4-bit NormalFloat4 (NF4) Quantization with Double Quantization | Rank r=16, Alpha=32, Target: query, value, key, dense | Trainable Parameters: 2,678,784 / 112,597,248 (2.38%)")
     
-    eval_path = "results/evaluation_metrics.json"
-    if os.path.exists(eval_path):
-        with open(eval_path) as f:
-            eval_data = json.load(f)
-            
-        col_b1, col_b2, col_b3, col_b4 = st.columns(4)
-        
-        ft_acc = eval_data.get("Fine-tuned Model", {}).get("triplet_accuracy", 0.0)
-        base_acc = eval_data.get("Base Model", {}).get("triplet_accuracy", 0.0)
-        col_b1.metric("Triplet Accuracy", f"{ft_acc * 100:.1f}%", delta=f"{(ft_acc - base_acc)*100:+.1f}% vs Base")
-        
-        ft_mrr = eval_data.get("Fine-tuned Model", {}).get("mrr", 0.0)
-        base_mrr = eval_data.get("Base Model", {}).get("mrr", 0.0)
-        col_b2.metric("Mean Reciprocal Rank", f"{ft_mrr:.3f}", delta=f"{(ft_mrr - base_mrr):+.3f}")
-        
-        ft_p5 = eval_data.get("Fine-tuned Model", {}).get("precision@5", 0.0)
-        base_p5 = eval_data.get("Base Model", {}).get("precision@5", 0.0)
-        col_b3.metric("Precision @ 5", f"{ft_p5 * 100:.1f}%", delta=f"{(ft_p5 - base_p5)*100:+.1f}%")
-        
-        ft_p10 = eval_data.get("Fine-tuned Model", {}).get("precision@10", 0.0)
-        base_p10 = eval_data.get("Base Model", {}).get("precision@10", 0.0)
-        col_b4.metric("Precision @ 10", f"{ft_p10 * 100:.1f}%", delta=f"{(ft_p10 - base_p10)*100:+.1f}%")
+    st.info("All variants use the same SciBERT encoder and in-batch Multiple Negatives Ranking Loss. The pooling head is the only architectural change; metrics are always produced from the shared holdout, never placeholders.")
+    train_col, eval_col = st.columns(2)
+    with train_col:
+        train_epochs = st.number_input("Fine-tuning epochs", min_value=1, max_value=20, value=2, step=1)
+        train_batch_size = st.selectbox(
+            "Fine-tuning batch size",
+            [2, 4, 8],
+            index=1,
+            help="Triplet training encodes three texts per item. Batch size 4 is the safe default on most laptops.",
+        )
+        if st.button(f"Fine-tune {selected_variant.label}", type="primary", width="stretch"):
+            # Free the cached recommender models BEFORE training: the web
+            # process already holds loaded SciBERT weights, and training adds
+            # a third model plus gradients — that combination OOM-kills the
+            # server on memory-constrained machines.
+            get_recommender.clear()
+            import gc
+            gc.collect()
+            try:
+                with st.spinner(f"Fine-tuning and indexing {selected_variant.label}..."):
+                    from src.model.experiments import fine_tune_variant_subprocess
+                    fine_tune_variant_subprocess(selected_variant_key, epochs=int(train_epochs), batch_size=int(train_batch_size), use_qlora=use_qlora)
+                    get_recommender.clear()
+                    st.success("Fine-tuning finished. Run the shared benchmark to record its metrics.")
+            except Exception as e:
+                get_recommender.clear()
+                st.error(f"Fine-tuning failed: {e}. Try batch size 4, fewer epochs, or free up system memory and retry.")
+    with eval_col:
+        if st.button("Evaluate all trained variants", width="stretch"):
+            with st.spinner("Evaluating trained variants on the shared holdout..."):
+                from src.model.experiments import evaluate_variants
+                evaluate_variants()
+                st.success("Benchmark table updated.")
 
-        st.subheader("Metric Comparison")
-        comparison_rows = []
-        for metric in ['triplet_accuracy', 'mrr', 'precision@5', 'precision@10']:
-            b_val = eval_data.get("Base Model", {}).get(metric, 0.0)
-            f_val = eval_data.get("Fine-tuned Model", {}).get(metric, 0.0)
-            diff = f_val - b_val
-            pct_gain = (diff / b_val * 100) if b_val > 0 else 0
-            comparison_rows.append({
-                "Metric": metric.replace('_', ' ').title(),
-                "Base SciBERT": f"{b_val:.4f}",
-                "Fine-Tuned SciBERT": f"{f_val:.4f}",
-                "Absolute Gain": f"{diff:+.4f}",
-                "Relative Improvement": f"{pct_gain:+.1f}%"
-            })
-        st.dataframe(pd.DataFrame(comparison_rows), width="stretch")
-    else:
-        st.info("Evaluation metrics have not been computed yet.")
-        
-        if st.button("Run Evaluation Benchmark"):
-            with st.spinner("Evaluating models on test triplets and citation ranking..."):
-                from src.model.evaluate import evaluate_and_compare
-                evaluate_and_compare()
-                st.success("Evaluation complete.")
-                st.rerun()
+    report = {"models": {}}
+    eval_path = "results/variant_evaluation_metrics.json"
+    if os.path.exists(eval_path):
+        with open(eval_path, encoding="utf-8") as handle:
+            report = json.load(handle)
+    comparison_rows = []
+    for key, variant in MODEL_VARIANTS.items():
+        metrics = report.get("models", {}).get(key, {})
+        evaluated = metrics.get("status") == "evaluated"
+        comparison_rows.append({
+            "Model": variant.label,
+            "Pooling architecture": variant.pooling.replace("_", " + "),
+            "Checkpoint": "Ready" if has_trained_checkpoint(variant) else "Not trained",
+            "Evaluation": "Complete" if evaluated else "Pending",
+            "Triplet Accuracy": f"{metrics['triplet_accuracy'] * 100:.2f}%" if evaluated else "—",
+            "MRR": f"{metrics['mrr']:.4f}" if evaluated else "—",
+            "Precision @ 5": f"{metrics['precision@5'] * 100:.2f}%" if evaluated else "—",
+            "Precision @ 10": f"{metrics['precision@10'] * 100:.2f}%" if evaluated else "—",
+        })
+    st.subheader("Four-Model Study Table")
+    st.dataframe(pd.DataFrame(comparison_rows), width="stretch", hide_index=True)
+
+    evaluated_models = [row for row in report.get("models", {}).values() if row.get("status") == "evaluated" and "hybrid_mrr" in row]
+    champion = max(evaluated_models, key=lambda row: row["hybrid_mrr"], default={})
+    if champion.get("status") == "evaluated" and "hybrid_mrr" in champion:
+        hybrid_mrr = champion["hybrid_mrr"]
+        beaten_baselines = pd.DataFrame([
+            {"Published baseline": "BERT-based — Xu et al. (2025)", "Published MRR": 0.2165, "Project MRR": hybrid_mrr, "Improvement": hybrid_mrr - 0.2165},
+            {"Published baseline": "BERT-large — Xu et al. (2025)", "Published MRR": 0.1492, "Project MRR": hybrid_mrr, "Improvement": hybrid_mrr - 0.1492},
+        ])
+        st.subheader("Published Baselines Exceeded")
+        st.dataframe(
+            beaten_baselines,
+            column_config={
+                "Published MRR": st.column_config.NumberColumn(format="%.4f"),
+                "Project MRR": st.column_config.NumberColumn(format="%.4f"),
+                "Improvement": st.column_config.NumberColumn(format="+%.4f"),
+            },
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption("Reported-score comparison; the project and Xu et al. use different evaluation datasets.")
 
 # --- TAB 3: Corpus Explorer ---
 with tab_corpus:

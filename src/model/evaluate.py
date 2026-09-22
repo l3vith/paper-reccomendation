@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from typing import List, Tuple, Dict, Any
 from sentence_transformers import SentenceTransformer, util
+from rank_bm25 import BM25Okapi
 from .build_triplets import load_papers, build_paper_text
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -133,6 +134,108 @@ def compute_mrr_and_precision(model: SentenceTransformer, papers: List[Dict[str,
         metrics[f'precision@{k}'] = precision[k] / n_queries
         
     return metrics
+
+
+def compute_triplet_retrieval_metrics(
+    model: SentenceTransformer,
+    test_triplets: List[Tuple[str, str, str]],
+    k_values: List[int] = [5, 10],
+    batch_size: int = 32,
+) -> Dict[str, float]:
+    """Evaluate retrieval when the local corpus has no citation graph.
+
+    Each unique held-out anchor is a query, its held-out positive texts are
+    relevant documents, and all held-out positive/negative texts form the
+    candidate corpus. This keeps retrieval evaluation separate from the
+    training split while producing real labels for arXiv-only databases.
+    """
+    relevance_by_query: Dict[str, set[str]] = {}
+    candidate_texts: list[str] = []
+    seen_candidates: set[str] = set()
+
+    for anchor, positive, negative in test_triplets:
+        relevance_by_query.setdefault(anchor, set()).add(positive)
+        for text in (positive, negative):
+            if text and text not in seen_candidates:
+                seen_candidates.add(text)
+                candidate_texts.append(text)
+
+    if not relevance_by_query or not candidate_texts:
+        return {"mrr": 0.0, **{f"precision@{k}": 0.0 for k in k_values}}
+
+    queries = list(relevance_by_query)
+    query_embeddings = model.encode(queries, batch_size=batch_size, convert_to_tensor=True, show_progress_bar=False)
+    corpus_embeddings = model.encode(candidate_texts, batch_size=batch_size, convert_to_tensor=True, show_progress_bar=False)
+    scores = util.cos_sim(query_embeddings, corpus_embeddings).cpu().numpy()
+
+    reciprocal_rank = 0.0
+    precision = {k: 0.0 for k in k_values}
+    for query_index, query_text in enumerate(queries):
+        ranked_indices = np.argsort(-scores[query_index])
+        ranked_texts = [candidate_texts[index] for index in ranked_indices if candidate_texts[index] != query_text]
+        relevant = relevance_by_query[query_text]
+
+        first_relevant_rank = next((rank for rank, text in enumerate(ranked_texts, start=1) if text in relevant), None)
+        if first_relevant_rank is not None:
+            reciprocal_rank += 1.0 / first_relevant_rank
+        for k in k_values:
+            precision[k] += sum(text in relevant for text in ranked_texts[:k]) / k
+
+    query_count = len(queries)
+    return {
+        "mrr": reciprocal_rank / query_count,
+        **{f"precision@{k}": precision[k] / query_count for k in k_values},
+    }
+
+
+def compute_hybrid_triplet_retrieval_metrics(
+    model: SentenceTransformer,
+    test_triplets: List[Tuple[str, str, str]],
+    k_values: List[int] = [5, 10],
+    dense_weight: float = 0.35,
+) -> Dict[str, float]:
+    """Evaluate the same BM25+dense fusion used by the production index."""
+    relevance_by_query: Dict[str, set[str]] = {}
+    candidate_texts: list[str] = []
+    seen_candidates: set[str] = set()
+    for anchor, positive, negative in test_triplets:
+        relevance_by_query.setdefault(anchor, set()).add(positive)
+        for text in (positive, negative):
+            if text and text not in seen_candidates:
+                seen_candidates.add(text)
+                candidate_texts.append(text)
+
+    if not relevance_by_query or not candidate_texts:
+        return {"hybrid_mrr": 0.0, **{f"hybrid_precision@{k}": 0.0 for k in k_values}}
+
+    queries = list(relevance_by_query)
+    query_embeddings = model.encode(queries, batch_size=32, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
+    corpus_embeddings = model.encode(candidate_texts, batch_size=32, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
+    dense_scores = query_embeddings @ corpus_embeddings.T
+
+    tokenize = lambda text: text.lower().split()
+    bm25 = BM25Okapi([tokenize(text) for text in candidate_texts])
+    lexical_scores = np.asarray([bm25.get_scores(tokenize(query)) for query in queries])
+    lexical_scores = (lexical_scores - lexical_scores.min(axis=1, keepdims=True)) / (np.ptp(lexical_scores, axis=1, keepdims=True) + 1e-9)
+    normalized_dense = np.clip((dense_scores + 1.0) / 2.0, 0.0, 1.0)
+    scores = (dense_weight * normalized_dense) + ((1.0 - dense_weight) * lexical_scores)
+
+    reciprocal_rank = 0.0
+    precision = {k: 0.0 for k in k_values}
+    for query_index, query_text in enumerate(queries):
+        ranked = [candidate_texts[index] for index in np.argsort(-scores[query_index]) if candidate_texts[index] != query_text]
+        relevant = relevance_by_query[query_text]
+        first_rank = next((rank for rank, text in enumerate(ranked, start=1) if text in relevant), None)
+        if first_rank is not None:
+            reciprocal_rank += 1.0 / first_rank
+        for k in k_values:
+            precision[k] += sum(text in relevant for text in ranked[:k]) / k
+
+    query_count = len(queries)
+    return {
+        "hybrid_mrr": reciprocal_rank / query_count,
+        **{f"hybrid_precision@{k}": precision[k] / query_count for k in k_values},
+    }
 
 def evaluate_and_compare(finetuned_path: str = 'models/scibert-finetuned-papers', 
                          base_model_name: str = 'allenai/scibert_scivocab_uncased', 

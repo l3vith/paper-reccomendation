@@ -3,8 +3,8 @@ address = "127.0.0.1"
 port = 8501
 headless = true
 fileWatcherType = "none"
-enableCORS = false
-enableXsrfProtection = true
+enableCORS = true
+enableXsrfProtection = false
 
 [client]
 showErrorDetails = false

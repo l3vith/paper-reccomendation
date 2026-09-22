@@ -16,8 +16,8 @@ The system consists of three main phases:
 Using **uv** (recommended):
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/course-project.git
-cd course-project
+git clone git@github.com:l3vith/paper-reccomendation.git
+cd paper-reccomendation
 
 # Sync environment and install dependencies
 uv sync
@@ -28,7 +28,18 @@ Alternatively using standard pip:
 pip install -r requirements.txt
 ```
 
-> **Note**: GPU is highly recommended for the model fine-tuning and inference steps. For CPU-only environments, adjust batch sizes and expect longer processing times.
+> **Note**: GPU is helpful but optional. The project runs on CUDA when available, Apple Silicon MPS on macOS, and CPU on Windows or Linux. On a CPU-only laptop, choose batch size 2 or 4 and expect fine-tuning to take longer.
+
+### Windows
+
+The app supports Windows 10/11 with Python 3.11+. Install [uv](https://docs.astral.sh/uv/) or use pip, then run the same commands above from PowerShell:
+
+```powershell
+uv sync
+uv run streamlit run app_streamlit.py
+```
+
+Text-to-speech uses the installed Windows SAPI voice and produces a standard PCM WAV file for browser playback. No Apple-specific audio tools are required on Windows.
 
 ## Web Application (Streamlit UI)
 
@@ -39,7 +50,8 @@ uv run streamlit run app_streamlit.py
 This opens the web interface with:
 - **Adaptive Discovery**: Local FAISS search with automatic live web scraping and model updating on sparse topics.
 - **Seed Paper Similarity**: Input reference paper Title and Abstract.
-- **Benchmark Dashboard**: Quantitative comparison of Fine-Tuned SciBERT vs. Base SciBERT.
+- **Synchronized PDF Reader**: View the downloaded PDF in-browser, read the current page aloud, and follow the highlighted word in a live transcript.
+- **Four-model benchmark dashboard**: Fine-tune and compare four controlled SciBERT variants in one held-out-metrics table.
 - **Corpus Explorer**: Searchable table of all stored research papers.
 
 ## Quick Start (with `uv`)
@@ -92,3 +104,23 @@ course-project/
 - **Phase 1: Data Collection (`src/scraper`)**: Aggregates metadata into a unified SQLite format (`data/papers.db`).
 - **Phase 2: Representation Learning (`src/model`)**: Creates semantic embeddings that accurately capture technical domain similarities.
 - **Phase 3: Retrieval (`src/recommender`)**: Employs Inner Product vector search to retrieve the most relevant papers instantly.
+
+## Four SciBERT variants for the study
+
+The sidebar selects the model used for recommendations. Every variant retains
+the same SciBERT encoder and TripletLoss setup; only its pooling architecture
+changes. This makes the comparison reproducible while producing distinct paper
+representations.
+
+| Variant | Pooling head | Embedding size |
+|---|---|---:|
+| SciBERT Mean Pooling | Original mean token pooling | 768 |
+| SciBERT [CLS] Pooling | Final `[CLS]` token | 768 |
+| SciBERT Mean + Max Pooling | Concatenated mean and max pooling | 1,536 |
+| SciBERT Weighted-Mean Pooling | Position-weighted mean pooling | 768 |
+
+Use **Model Benchmarks → Fine-tune selected model** for each profile, then
+select **Evaluate all trained variants**. The resulting table reports actual
+Triplet Accuracy, MRR, Precision@5, and Precision@10 on the same holdout.
+Each variant owns a separate FAISS index, so every active search uses the
+matching model embeddings.
