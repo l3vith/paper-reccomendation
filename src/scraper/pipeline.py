@@ -12,13 +12,14 @@ from typing import List
 
 from .arxiv_scraper import search_arxiv
 from .semantic_scholar_scraper import search_semantic_scholar, enrich_with_citations
+from .firecrawl_scraper import search_firecrawl
 from .data_store import PaperStore
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def run_pipeline(topics: List[str], max_per_topic: int = 500, enrich_citations: bool = True, max_citation_enrichment: int = 100, db_path: str = 'data/papers.db') -> None:
+def run_pipeline(topics: List[str], max_per_topic: int = 500, enrich_citations: bool = True, max_citation_enrichment: int = 100, db_path: str = 'data/papers.db', use_firecrawl: bool = True, firecrawl_max_per_topic: int = 50) -> None:
     """
     Run the complete scraping pipeline.
 
@@ -33,6 +34,7 @@ def run_pipeline(topics: List[str], max_per_topic: int = 500, enrich_citations: 
     
     total_arxiv = 0
     total_s2 = 0
+    total_fc = 0
     
     for topic in topics:
         logger.info(f"=== Starting pipeline for topic: '{topic}' ===")
@@ -41,6 +43,7 @@ def run_pipeline(topics: List[str], max_per_topic: int = 500, enrich_citations: 
         logger.info("Scraping arXiv...")
         arxiv_papers = search_arxiv(topic, max_results=max_per_topic)
         total_arxiv += len(arxiv_papers)
+        total_fc += len(fc_papers)
         
         # 2. Scrape Semantic Scholar
         logger.info("Scraping Semantic Scholar...")
@@ -51,18 +54,28 @@ def run_pipeline(topics: List[str], max_per_topic: int = 500, enrich_citations: 
         if enrich_citations and s2_papers:
             logger.info("Enriching Semantic Scholar papers with citations...")
             s2_papers = enrich_with_citations(s2_papers, max_papers=max_citation_enrichment)
-            
+
+        # 3b. Search Firecrawl research index (titles + abstracts + PDF links)
+        fc_papers = []
+        if use_firecrawl:
+            logger.info("Searching Firecrawl research index...")
+            try:
+                fc_papers = search_firecrawl(topic, max_results=firecrawl_max_per_topic)
+            except Exception as exc:
+                logger.warning(f"Firecrawl source skipped: {exc}")
+
         # 4. Merge and store
         logger.info("Storing papers in database...")
         inserted_arxiv = store.insert_papers(arxiv_papers)
         inserted_s2 = store.insert_papers(s2_papers)
-        
-        logger.info(f"Topic '{topic}' summary: Inserted {inserted_arxiv}/{len(arxiv_papers)} arXiv papers and {inserted_s2}/{len(s2_papers)} Semantic Scholar papers (skipped duplicates).")
+        inserted_fc = store.insert_papers(fc_papers) if fc_papers else 0
+
+        logger.info(f"Topic '{topic}' summary: Inserted {inserted_arxiv}/{len(arxiv_papers)} arXiv, {inserted_s2}/{len(s2_papers)} Semantic Scholar and {inserted_fc}/{len(fc_papers)} Firecrawl papers (skipped duplicates).")
 
     # Final Summary and Export
     total_db_count = store.count()
     logger.info(f"=== Pipeline Complete ===")
-    logger.info(f"Total papers scraped: arXiv={total_arxiv}, Semantic Scholar={total_s2}")
+    logger.info(f"Total papers scraped: arXiv={total_arxiv}, Semantic Scholar={total_s2}, Firecrawl={total_fc}")
     logger.info(f"Total papers in database: {total_db_count}")
     
     export_path = os.path.join(os.path.dirname(os.path.abspath(db_path)), 'papers.jsonl')
@@ -75,6 +88,8 @@ def main():
     parser.add_argument("--topics", type=str, required=True, help="Comma-separated list of topics (e.g., 'NLP,transformers,attention mechanism')")
     parser.add_argument("--max-per-topic", type=int, default=500, help="Maximum number of results to fetch per topic per source")
     parser.add_argument("--no-citations", action="store_true", help="Skip citation enrichment for Semantic Scholar papers")
+    parser.add_argument("--no-firecrawl", action="store_true", help="Skip the Firecrawl research-index source")
+    parser.add_argument("--firecrawl-max", type=int, default=50, help="Maximum Firecrawl papers per topic")
     parser.add_argument("--db-path", type=str, default="data/papers.db", help="Path to the SQLite database file")
     
     args = parser.parse_args()
@@ -86,6 +101,8 @@ def main():
         max_per_topic=args.max_per_topic,
         enrich_citations=not args.no_citations,
         max_citation_enrichment=100,
+        use_firecrawl=not args.no_firecrawl,
+        firecrawl_max_per_topic=args.firecrawl_max,
         db_path=args.db_path
     )
 
