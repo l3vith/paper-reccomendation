@@ -1020,11 +1020,10 @@ with tab_eval:
     st.subheader("SciNUP Retrieval Results vs Published Paper")
     st.caption("RRF fusion rows (fine-tuned dense + BM25) from our Kaggle runs, compared against SciNUP (Arustashvili & Balog, ECIR '26), Table 3. Higher is better on every metric.")
     scinup_rows = [
-        {"Run": "rrf (minilm_ft, ours)", "n": 100, "R@100": 0.346985, "MAP": 0.220375, "MRR": 0.627553, "NDCG@10": 0.365962},
-        {"Run": "rrf (bge_ft, ours)", "n": 1000, "R@100": 0.381850, "MAP": 0.230911, "MRR": 0.637286, "NDCG@10": 0.371861},
-        {"Run": "kNN-SciBERT (paper)", "n": 1000, "R@100": 0.1480, "MAP": 0.0232, "MRR": 0.2182, "NDCG@10": 0.1019},
-        {"Run": "BM25 (paper)", "n": 1000, "R@100": 0.3491, "MAP": 0.1148, "MRR": 0.4661, "NDCG@10": 0.2869},
-        {"Run": "BGE-v2-MiniCPM (paper)", "n": 1000, "R@100": 0.4203, "MAP": 0.1673, "MRR": 0.5393, "NDCG@10": 0.3541},
+        {"Run": "specter2 + BM25 (RRF, ours)", "n": 100, "R@100": 0.3351, "MAP": 0.1069, "MRR": 0.4721, "NDCG@10": 0.3020},
+        {"Run": "scibert + BM25 (RRF, ours)", "n": 100, "R@100": 0.333815, "MAP": 0.215531, "MRR": 0.607507, "NDCG@10": 0.362203},
+        {"Run": "minilm + BM25 (RRF, ours)", "n": 100, "R@100": 0.346985, "MAP": 0.220375, "MRR": 0.627553, "NDCG@10": 0.365962},
+        {"Run": "bge + BM25 (RRF, ours)", "n": 1000, "R@100": 0.381850, "MAP": 0.230911, "MRR": 0.637286, "NDCG@10": 0.371861},
         {"Run": "RRF ensemble (paper, best)", "n": 1000, "R@100": 0.4136, "MAP": 0.2163, "MRR": 0.6333, "NDCG@10": 0.4481},
     ]
     st.dataframe(
@@ -1038,7 +1037,7 @@ with tab_eval:
         width="stretch",
         hide_index=True,
     )
-    st.success("Our bge RRF fusion beats the paper's best model (RRF ensemble) on MAP (0.2309 vs 0.2163) and MRR (0.6373 vs 0.6333).")
+    st.success("bge + BM25 beats the paper's RRF ensemble on MAP (0.2309 vs 0.2163) and MRR (0.6373 vs 0.6333); minilm + BM25 beats it on MAP (0.2204 vs 0.2163).")
     st.caption("Our rows: Kaggle TREC runs scored with the verified evaluator. Paper rows: published Table 3 values.")
 
 # --- TAB 3: Corpus Explorer ---
