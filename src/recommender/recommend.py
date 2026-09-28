@@ -11,12 +11,37 @@ from src.model.query_expansion import ScientificQueryExpander
 
 # Import scrapers if they exist
 try:
-    from src.scraper import arxiv_scraper, semantic_scholar_scraper
+    from src.scraper import arxiv_scraper, semantic_scholar_scraper, firecrawl_scraper
 except ImportError:
     arxiv_scraper = None
     semantic_scholar_scraper = None
+    firecrawl_scraper = None
 
 logger = logging.getLogger(__name__)
+
+
+def _diversify_sources(results: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    """Interleave source-ranked candidates so one provider cannot hide another."""
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for result in results:
+        source = str(result.get("source") or "unknown").lower()
+        buckets.setdefault(source, []).append(result)
+    if len(buckets) < 2:
+        return results[:top_k]
+
+    # Keep each provider's score ordering, start with whichever provider has
+    # the strongest candidate, then alternate while both have candidates.
+    source_order = sorted(
+        buckets,
+        key=lambda source: float(buckets[source][0].get("score", 0.0)),
+        reverse=True,
+    )
+    diversified = []
+    while len(diversified) < top_k and any(buckets.values()):
+        for source in source_order:
+            if buckets[source] and len(diversified) < top_k:
+                diversified.append(buckets[source].pop(0))
+    return diversified
 
 
 class PaperRecommender:
@@ -28,7 +53,10 @@ class PaperRecommender:
         index_path: str = "data/faiss_index.bin",
         mapping_path: str = "data/paper_id_map.json",
         pooling: str = "mean",
-        db_path: str = "data/papers.db"
+        db_path: str = "data/papers.db",
+        document_format: str = "sep",
+        max_seq_length: int | None = None,
+        require_checkpoint: bool = False,
     ) -> None:
         """
         Initialize the recommender.
@@ -39,9 +67,12 @@ class PaperRecommender:
             mapping_path: Path to the ID mapping.
             db_path: Path to the local database.
         """
-        self.index = PaperIndex(model_path, index_path, mapping_path, pooling=pooling)
+        self.index = PaperIndex(model_path, index_path, mapping_path, pooling=pooling,
+                                document_format=document_format, max_seq_length=max_seq_length,
+                                require_checkpoint=require_checkpoint)
         self.store = PaperStore(db_path)
         self.expander = ScientificQueryExpander(db_path=db_path)
+        self.last_search_diagnostics: Dict[str, Any] = {}
 
     def recommend_by_paper(self, title: str, abstract: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """
@@ -55,7 +86,7 @@ class PaperRecommender:
         Returns:
             List of recommended papers.
         """
-        query_text = f"{title} [SEP] {abstract}"
+        query_text = self.index.paper_text(title, abstract)
         return self.index.search(query_text, top_k=top_k)
 
     def recommend_by_topic(self, topic: str, top_k: int = 10, use_expansion: bool = True) -> List[Dict[str, Any]]:
@@ -119,35 +150,40 @@ class PaperRecommender:
         # Step 1: Query local index with expanded dense query
         results = self.index.search(dense_query, top_k=top_k)
         
-        good_matches = [r for r in results if r.get('score', 0) >= similarity_threshold]
-        is_sparse = len(good_matches) < min_good_results or (results and results[0].get('score', 0) < similarity_threshold) or len(results) == 0
+        # Sparsity is about semantic cosine similarity, not the lexical rerank.
+        good_matches = [r for r in results if r.get('dense_score', r.get('score', 0)) >= similarity_threshold]
+        is_sparse = len(good_matches) < min_good_results or (results and results[0].get('dense_score', results[0].get('score', 0)) < similarity_threshold) or len(results) == 0
 
-        if not is_sparse:
-            logger.info(
-                f"Sufficient knowledge found in local index for '{clean_query}' "
-                f"({len(good_matches)} high-quality matches, top score: {results[0]['score']:.4f}). "
-                "Serving from local index."
-            )
-            return results
-
-        # Step 2: Sparsity detected -> Trigger live fetch & re-index
-        top_score = results[0]['score'] if results else 0.0
-        logger.info(
-            f"Information for query '{clean_query}' is sparse in local index "
-            f"(top score: {top_score:.4f}, threshold: {similarity_threshold}). "
-            f"Triggering live scraping and incremental indexing..."
-        )
+        # Always refresh arXiv for topic searches. Returning early on a good
+        # local cosine score used to prevent arXiv from being queried at all,
+        # leaving the UI dominated by whichever provider populated the index
+        # first. Semantic Scholar remains the broader fallback for sparse topics.
+        top_score = results[0].get('dense_score', results[0]['score']) if results else 0.0
+        logger.info("Refreshing arXiv candidates for '%s' (local top cosine %.4f).", clean_query, top_score)
 
         new_papers = []
+        self.last_search_diagnostics = {
+            "arxiv": {"count": 0, "errors": [], "rate_limited": False, "request_rejected": False}
+        }
         if arxiv_scraper:
             logger.info(f"Live scraping arXiv for query: '{clean_query}'...")
             try:
-                arxiv_papers = arxiv_scraper.search_arxiv(clean_query, max_results=max_scrape)
+                # Pass the untouched user query so the scraper's broad
+                # all-field fallback preserves terms such as "diseases".
+                arxiv_papers = arxiv_scraper.search_arxiv(query, max_results=max_scrape)
                 new_papers.extend(arxiv_papers)
+                self.last_search_diagnostics["arxiv"] = dict(
+                    getattr(arxiv_scraper, "last_search_status", {})
+                )
             except Exception as e:
+                self.last_search_diagnostics["arxiv"] = {
+                    "count": 0, "errors": [f"{type(e).__name__}: {e}"],
+                    "rate_limited": "429" in str(e),
+                    "request_rejected": "406" in str(e),
+                }
                 logger.error(f"Error scraping arXiv: {e}")
 
-        if semantic_scholar_scraper:
+        if is_sparse and semantic_scholar_scraper:
             logger.info(f"Live scraping Semantic Scholar for query: '{clean_query}'...")
             try:
                 ss_papers = semantic_scholar_scraper.search_semantic_scholar(clean_query, max_results=max_scrape)
@@ -155,8 +191,21 @@ class PaperRecommender:
             except Exception as e:
                 logger.error(f"Error scraping Semantic Scholar: {e}")
 
+        # Firecrawl research index: independent third source, and the fallback
+        # when arXiv rejects the request (HTTP 406) or returns nothing.
+        arxiv_failed = not new_papers or self.last_search_diagnostics.get("arxiv", {}).get("request_rejected", False)
+        if firecrawl_scraper and (is_sparse or arxiv_failed):
+            logger.info(f"Live searching Firecrawl research index for query: '{clean_query}'...")
+            try:
+                fc_papers = firecrawl_scraper.search_firecrawl(clean_query, max_results=min(max_scrape, 40))
+                new_papers.extend(fc_papers)
+            except Exception as e:
+                logger.error(f"Error searching Firecrawl: {e}")
+
         if not new_papers:
-            logger.warning(f"No new papers found online for '{clean_query}'. Returning existing local matches.")
+            logger.warning("No new online papers found for '%s'; serving local matches.", clean_query)
+            if not is_sparse:
+                logger.info("Sufficient local matches found; no Semantic Scholar fetch was needed.")
             return results
 
         # Save new papers to SQLite store
@@ -180,8 +229,16 @@ class PaperRecommender:
                 logger.debug(f"Triplets export skipped: {e}")
 
         # Step 5: Return search results from updated FAISS index
-        updated_results = self.index.search(dense_query, top_k=top_k)
-        return updated_results
+        # Search a wider pool before source interleaving; otherwise an arXiv
+        # result ranked just below top_k could never make it into the display.
+        updated_results = self.index.search(dense_query, top_k=max(top_k * 5, 50))
+        diversified = _diversify_sources(updated_results, top_k)
+        source_counts: Dict[str, int] = {}
+        for result in diversified:
+            source = str(result.get("source") or "unknown")
+            source_counts[source] = source_counts.get(source, 0) + 1
+        logger.info("Returning %d recommendations with source mix: %s", len(diversified), source_counts)
+        return diversified
 
     def format_results(self, results: List[Dict[str, Any]]) -> str:
         """
