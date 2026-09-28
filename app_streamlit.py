@@ -214,7 +214,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_resource(show_spinner="Loading selected SciBERT recommendation model...")
+@st.cache_resource(show_spinner="Loading recommendation model...")
 def get_recommender(variant_key: str):
     """Load and cache the recommender engine."""
     from src.recommender.recommend import PaperRecommender
@@ -224,6 +224,9 @@ def get_recommender(variant_key: str):
         index_path=variant.index_path,
         mapping_path=variant.mapping_path,
         pooling=variant.pooling,
+        document_format=variant.document_format,
+        max_seq_length=variant.max_seq_length,
+        require_checkpoint=variant.require_checkpoint,
     )
 
 
@@ -361,18 +364,9 @@ def get_s2_pdf_url(s2_paper_id: str) -> str:
     if not s2_paper_id or len(s2_paper_id) < 10:
         return ""
     try:
-        import requests
-        url = f"https://api.semanticscholar.org/graph/v1/paper/{s2_paper_id}?fields=openAccessPdf,externalIds"
-        resp = requests.get(url, timeout=8)
-        if resp.status_code == 200:
-            data = resp.json()
-            oa = data.get("openAccessPdf") or {}
-            if oa.get("url"):
-                return oa["url"]
-            ext_ids = data.get("externalIds") or {}
-            arxiv_id = ext_ids.get("ArXiv") or ext_ids.get("arxiv")
-            if arxiv_id:
-                return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+        # Use the shared authenticated/rate-limited Semantic Scholar client.
+        from src.scraper.semantic_scholar_scraper import get_open_access_pdf_url
+        return get_open_access_pdf_url(s2_paper_id)
     except Exception:
         pass
     return ""
@@ -403,13 +397,18 @@ def render_paper_reader(r: dict, card_index: int, show_score: bool = True, score
     source = str(r.get('source') or 'arxiv').replace('_', ' ')
     external_id = str(r.get('external_id') or '')
     pdf_url = str(r.get('pdf_url') or '')
+    is_s2 = source.lower() == "semantic scholar"
 
     raw_abs = r.get('abstract')
     abstract = str(raw_abs) if raw_abs and not pd.isna(raw_abs) else 'No abstract available.'
     score = r.get('score', 0.0)
 
-    # Canonical URL
-    if pdf_url:
+    # Keep the landing page separate from the downloadable PDF URL.
+    if r.get("paper_url"):
+        paper_url = str(r["paper_url"])
+    elif is_s2 and external_id:
+        paper_url = f"https://www.semanticscholar.org/paper/{external_id}"
+    elif pdf_url:
         paper_url = pdf_url
     elif external_id:
         paper_url = f"https://arxiv.org/abs/{external_id}"
@@ -420,15 +419,24 @@ def render_paper_reader(r: dict, card_index: int, show_score: bool = True, score
 
     # Build PDF download target URL
     clean_eid = str(external_id).replace("v1", "").replace("v2", "").strip()
-    is_s2 = source.lower() == "semantic_scholar"
+    # Firecrawl rows carry the numeric Firecrawl paperId, not an arXiv ID —
+    # recover the real arXiv identifier from the stored PDF/abs URL instead.
+    if source.lower() == "firecrawl":
+        import re as _re
+        arxiv_match = _re.search(r"(\d{4}\.\d{4,5})(v\d+)?", f"{pdf_url} {paper_url}")
+        if arxiv_match:
+            clean_eid = arxiv_match.group(1)
+            is_arxiv = True
+    is_pdf_url = pdf_url.lower().split("?", 1)[0].endswith(".pdf")
 
     if is_arxiv and clean_eid and not is_s2:
         # Direct arXiv paper
         pdf_target = f"https://arxiv.org/pdf/{clean_eid}.pdf"
     elif is_s2 and clean_eid:
-        # Look up the real PDF link from Semantic Scholar API (cached)
-        pdf_target = get_s2_pdf_url(clean_eid)
-    elif pdf_url and pdf_url.endswith(".pdf"):
+        # Prefer search-result openAccessPdf; fall back to authenticated API
+        # lookup for older index records that only have a Semantic Scholar ID.
+        pdf_target = pdf_url if is_pdf_url else get_s2_pdf_url(clean_eid)
+    elif is_pdf_url:
         pdf_target = pdf_url
     else:
         pdf_target = ""
@@ -711,10 +719,11 @@ st.markdown("""
 with st.sidebar:
     st.markdown("### Settings")
     selected_variant_key = st.selectbox(
-        "SciBERT model variant",
+        "Recommendation model",
         options=list(MODEL_VARIANTS),
+        index=list(MODEL_VARIANTS).index("bge_ft"),
         format_func=lambda key: MODEL_VARIANTS[key].label,
-        help="Each profile keeps SciBERT and changes only the pooling head. It has its own checkpoint and FAISS index.",
+        help="Choose your trained BGE model or a SciBERT pooling variant. Each has a separate embedding index.",
     )
     selected_variant = get_variant(selected_variant_key)
     st.caption(selected_variant.description)
@@ -723,7 +732,7 @@ with st.sidebar:
         "Search Mode",
         options=["Adaptive Search (Smart)", "Seed Paper Similarity", "Local Index Only", "Force Live Scrape"],
         index=0,
-        help="Adaptive Search checks the local FAISS index first and only scrapes + fine-tunes if results are sparse."
+        help="Adaptive Search refreshes arXiv candidates for each topic and checks Semantic Scholar when the local matches are sparse."
     )
     
     st.divider()
@@ -731,7 +740,7 @@ with st.sidebar:
     top_k = st.slider("Top Recommendations (K)", min_value=3, max_value=20, value=6, step=1)
     
     with st.expander("Advanced Configuration", expanded=False):
-        enable_expansion = st.checkbox("Enable Query Expansion", value=True, help="Expands query with scientific acronyms and domain concepts.")
+        enable_expansion = st.checkbox("Enable Query Expansion", value=True, help="Adds recognized scientific acronym definitions while keeping topical queries literal.")
         use_qlora = st.checkbox("Use Q-LoRA (4-bit NF4)", value=True, help="Applies 4-bit NormalFloat4 Quantization with LoRA adapters for maximum parameter and memory efficiency.")
         threshold = st.slider(
             "Sparsity Threshold",
@@ -766,8 +775,12 @@ with st.sidebar:
                 index_path=selected_variant.index_path,
                 mapping_path=selected_variant.mapping_path,
                 pooling=selected_variant.pooling,
+                document_format=selected_variant.document_format,
+                max_seq_length=selected_variant.max_seq_length,
+                require_checkpoint=selected_variant.require_checkpoint,
             )
             c = idx.build_index()
+            get_recommender.clear()
             st.success(f"Successfully indexed {c} papers.")
             st.rerun()
 
@@ -808,6 +821,12 @@ with tab_search:
 
         if search_clicked and query_input:
             st.session_state["search_query"] = query_input
+            # Drop results/messages from the previous attempt immediately;
+            # otherwise Streamlit keeps showing an old no-match warning while
+            # this slower live scrape is still running under the spinner.
+            st.session_state["search_results"] = None
+            st.session_state["search_info"] = None
+            st.session_state["search_terms_str"] = None
             terms_str = None
             if enable_expansion:
                 expansion_data = recommender.expander.expand(query_input)
@@ -828,10 +847,14 @@ with tab_search:
                         use_lora=use_qlora,
                         max_scrape=max_scrape
                     )
-                    st.session_state["search_info"] = ("success", "Live scraped papers from online sources and updated the index.")
+                    st.session_state["search_info"] = (
+                        "success" if results else "warning",
+                        "Found papers matching your topic and updated the index." if results
+                        else "No papers matching the specific topic terms were found. Try a broader query."
+                    )
                 else:  # Adaptive Search (Smart)
                     pre_check = recommender.recommend_by_topic(query_input, top_k=top_k, use_expansion=enable_expansion)
-                    has_good_match = bool(pre_check and pre_check[0].get('score', 0) >= threshold)
+                    has_good_match = bool(pre_check and pre_check[0].get('dense_score', pre_check[0].get('score', 0)) >= threshold)
                     
                     results = recommender.recommend_adaptive(
                         query=query_input,
@@ -844,8 +867,34 @@ with tab_search:
                     
                     if has_good_match:
                         st.session_state["search_info"] = ("info", "High similarity match found in local corpus. Served from index.")
+                    elif results:
+                        st.session_state["search_info"] = ("success", "Found additional papers matching your topic and updated the index.")
                     else:
-                        st.session_state["search_info"] = ("success", "Information was sparse in local corpus. Scraped fresh papers and updated index with Q-LoRA fine-tuning.")
+                        st.session_state["search_info"] = ("warning", "No papers matching the specific topic terms were found. Try a broader query.")
+
+                if results:
+                    source_counts = {}
+                    for result in results:
+                        source = str(result.get("source") or "unknown").replace("_", " ")
+                        source_counts[source] = source_counts.get(source, 0) + 1
+                    source_summary = ", ".join(
+                        f"{count} {source}" for source, count in sorted(source_counts.items())
+                    )
+                    st.session_state["search_info"] = (
+                        "info",
+                        f"Top results by source: {source_summary}."
+                    )
+                elif mode != "Local Index Only":
+                    arxiv_status = getattr(recommender, "last_search_diagnostics", {}).get("arxiv", {})
+                    if arxiv_status.get("rate_limited"):
+                        message = "arXiv temporarily rate-limited this search (HTTP 429). Wait a few seconds and retry; this does not mean the papers are absent."
+                    elif arxiv_status.get("request_rejected"):
+                        message = "arXiv rejected the API request (HTTP 406); this is a provider/request failure, not evidence that no papers exist. Try again later or use Semantic Scholar."
+                    elif arxiv_status.get("errors"):
+                        message = "The live arXiv search failed. Check the app logs for the API error; no-match is not confirmed."
+                    else:
+                        message = "No papers were returned for this query. Try a broader or alternate wording."
+                    st.session_state["search_info"] = ("warning", message)
 
             st.session_state["search_results"] = results
 
@@ -862,8 +911,10 @@ with tab_search:
                     st.info(msg)
                 elif kind == "success":
                     st.success(msg)
+                elif kind == "warning":
+                    st.warning(msg)
 
-            if not results:
+            if not results and not st.session_state.get("search_info"):
                 st.warning("No matching papers found. Try broadening your query.")
             else:
                 st.subheader(f"Top {len(results)} Recommendations")
@@ -918,11 +969,14 @@ with tab_search:
 # --- TAB 2: Model Benchmarks ---
 with tab_eval:
     st.subheader("Model Evaluation and Benchmarks")
-    st.caption("Controlled comparison of four fine-tuneable SciBERT pooling architectures on the same held-out triplets. MRR and Precision@K rank held-out positive papers among the held-out candidate corpus.")
+    st.caption("Available recommendation models and their recorded local evaluation results. Kaggle evaluation results are separate from this local benchmark.")
     
-    st.info("Q-LoRA Configuration: 4-bit NormalFloat4 (NF4) Quantization with Double Quantization | Rank r=16, Alpha=32, Target: query, value, key, dense | Trainable Parameters: 2,678,784 / 112,597,248 (2.38%)")
+    if selected_variant.require_checkpoint:
+        st.info("BGE was fully fine-tuned on Kaggle with FP16 training. The imported model uses CLS pooling and a 192-token input limit.")
+    else:
+        st.info("Local SciBERT training supports LoRA and optional 4-bit Q-LoRA.")
     
-    st.info("All variants use the same SciBERT encoder and in-batch Multiple Negatives Ranking Loss. The pooling head is the only architectural change; metrics are always produced from the shared holdout, never placeholders.")
+    st.info("The SciBERT profiles compare pooling heads. BGE is a separate encoder imported from Kaggle; its notebook evaluation uses a different dataset and must be interpreted separately.")
     train_col, eval_col = st.columns(2)
     with train_col:
         train_epochs = st.number_input("Fine-tuning epochs", min_value=1, max_value=20, value=2, step=1)
@@ -932,7 +986,9 @@ with tab_eval:
             index=1,
             help="Triplet training encodes three texts per item. Batch size 4 is the safe default on most laptops.",
         )
-        if st.button(f"Fine-tune {selected_variant.label}", type="primary", width="stretch"):
+        if selected_variant.require_checkpoint:
+            st.caption("This model was trained in Kaggle. Local SciBERT training is disabled for this checkpoint.")
+        if st.button(f"Fine-tune {selected_variant.label}", type="primary", width="stretch", disabled=selected_variant.require_checkpoint):
             # Free the cached recommender models BEFORE training: the web
             # process already holds loaded SciBERT weights, and training adds
             # a third model plus gradients — that combination OOM-kills the
@@ -975,7 +1031,7 @@ with tab_eval:
             "Precision @ 5": f"{metrics['precision@5'] * 100:.2f}%" if evaluated else "—",
             "Precision @ 10": f"{metrics['precision@10'] * 100:.2f}%" if evaluated else "—",
         })
-    st.subheader("Four-Model Study Table")
+    st.subheader("Model Study Table")
     st.dataframe(pd.DataFrame(comparison_rows), width="stretch", hide_index=True)
 
     evaluated_models = [row for row in report.get("models", {}).values() if row.get("status") == "evaluated" and "hybrid_mrr" in row]
